@@ -20,6 +20,7 @@ on:
 
 permissions:
   contents: write
+  issues: write
 
 concurrency:
   group: apk-${{ github.ref }}
@@ -100,10 +101,13 @@ jobs:
       - name: Install cargo-apk
         run: |
           set -euo pipefail
+          # `--locked` first (reproducible), then a plain install: a published crate whose
+          # committed lockfile names a since-yanked dependency only installs the second way.
           if [ -n "$CARGO_APK_VERSION" ]; then
-            cargo install cargo-apk --version "$CARGO_APK_VERSION" --locked
+            cargo install cargo-apk --version "$CARGO_APK_VERSION" --locked \
+              || cargo install cargo-apk --version "$CARGO_APK_VERSION"
           else
-            cargo install cargo-apk --locked
+            cargo install cargo-apk --locked || cargo install cargo-apk
           fi
           cargo apk --version
           rustc --version
@@ -221,3 +225,33 @@ jobs:
           fi
           gh release upload ci-latest "$APK" --clobber || gh release upload ci-latest "$APK"
           gh release view ci-latest --json assets --jq '.assets[] | "\(.name) \(.size) bytes"'
+
+      - name: Report failure details to an issue (the log host is not reachable everywhere)
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          JOB_ID=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs" \
+                     --jq '.jobs[] | select(.name | test("Cross-compile")) | .id' | head -1)
+          echo "job id: $JOB_ID"
+          gh api "repos/$GITHUB_REPOSITORY/actions/jobs/$JOB_ID/logs" > /tmp/job.log 2>/tmp/log.err || true
+          SIZE=$(wc -c < /tmp/job.log || echo 0)
+          echo "log bytes: $SIZE"; cat /tmp/log.err || true
+          # Keep the tail: the failing step's output is what explains the failure.
+          tail -c 60000 /tmp/job.log > /tmp/tail.txt 2>/dev/null || true
+          {
+            echo "Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            echo "Commit: $GITHUB_SHA"
+            echo ""
+            echo '```'
+            cat /tmp/tail.txt
+            echo '```'
+          } > /tmp/body.md
+          TITLE="CI build log"
+          NUM=$(gh issue list --state open --search "in:title \"$TITLE\"" --json number --jq '.[0].number' || true)
+          if [ -n "$NUM" ] && [ "$NUM" != "null" ]; then
+            gh issue comment "$NUM" --body-file /tmp/body.md
+          else
+            gh issue create --title "$TITLE" --body-file /tmp/body.md
+          fi
