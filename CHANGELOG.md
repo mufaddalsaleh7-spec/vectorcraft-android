@@ -1,5 +1,23 @@
 # Changelog
 
+## CI build — 2026-10-24 (arm64-v8a APK from GitHub Actions)
+
+| | |
+|---|---|
+| APK | `vectorcraft-0.9.0-arm64-v8a-20261024.apk` (31,023,933 bytes) — on the [`ci-latest`](https://github.com/mufaddalsaleh7-spec/vectorcraft-android/releases/tag/ci-latest) release |
+| sha256 | `efa5d51e32295cd425dd37ddabd9b8b05b105814309af8f841263a2c87ab6889` |
+| Built from | upstream `storytold/vectorcraft` @ `2ac3ba2b866ad9d34b2252dd8024f73e34f4b2b8` + this repository at `f756d0c` — no upstream file changed |
+| Toolchain | Rust 1.99.1, cargo-apk 0.10.0, NDK 27.2.12479018, build-tools 35.0.0, JDK 21 |
+| Verified | `apksigner verify`: v2 + v3 true; `aapt2`: `native-code: 'arm64-v8a'`, package `ai.storyteller.vectorcraft`, versionName `0.9.0`; `android_main` + `ANativeActivity_onCreate` exported |
+| Not verified | not launched on a device or emulator as part of this build — see the caveat in the README |
+
+### Added
+- `.github/workflows/build-apk.yml` — assembles the pinned upstream tree with this port crate, builds
+  `cargo apk build --release -p vectorcraft-android`, signs it, runs the README's verification checks
+  and publishes the APK to the `ci-latest` release (artifact kept for 30 days as well).
+- `docs/CI-BUILD.md` — what each step is for, the tool versions, and the verification output of the
+  published artifact.
+
 ## v0.1.1 — 2026-10-13 (scrolling, modifiers, fonts, picker wording)
 
 | | |

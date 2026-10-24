@@ -10,6 +10,8 @@ and egui interface, packaged as a NativeActivity APK for sideloading on arm64 de
 | Android package | `ai.storyteller.vectorcraft` |
 | Published APK | `vectorcraft-0.9.0-arm64-v8a-20261013.apk` — 29.6 MB, arm64-v8a, signed (release **v0.1.1**, 2026-10-13) |
 | APK sha256 | `c7848549067eb1192e7935f45cdbf91490f3366ccfdd73c5d44ce1236f219aa6` |
+| CI-built APK (this repo) | [`vectorcraft-0.9.0-arm64-v8a-20261024.apk`](https://github.com/mufaddalsaleh7-spec/vectorcraft-android/releases/tag/ci-latest) — 31,023,933 bytes, arm64-v8a, v2+v3 signed (2026-10-24, from the pinned upstream commit, see [`docs/CI-BUILD.md`](docs/CI-BUILD.md)) |
+| CI-built APK sha256 | `efa5d51e32295cd425dd37ddabd9b8b05b105814309af8f841263a2c87ab6889` |
 | Upstream files changed | No upstream files changed — the port is `apps/vectorcraft-android/` alone, so there is nothing to apply |
 | New port crate | `apps/vectorcraft-android/` — 1088 lines of Rust plus resources |
 
@@ -53,6 +55,16 @@ cargo apk build --release -p vectorcraft-android
 and the C compiler the native dependencies need), `scripts/build-apk.sh` wraps the build, and
 `scripts/verify-apk.sh` checks the artifact: `aapt2 dump badging`, `apksigner verify`, and `llvm-nm`
 on the `.so` inside the APK.
+
+## Build it in CI (how the published APK above was produced here)
+
+[`.github/workflows/build-apk.yml`](.github/workflows/build-apk.yml) runs the assembly above on
+GitHub Actions — upstream pin downloaded by `codeload`, `apps/vectorcraft-android/` copied in,
+nothing upstream edited — then cross-compiles with `cargo apk` against NDK r27.2, signs with a
+CI-generated sideload key, verifies the result with `aapt2` / `apksigner` / `llvm-nm`, and attaches
+the APK to the rolling [`ci-latest`](https://github.com/mufaddalsaleh7-spec/vectorcraft-android/releases/tag/ci-latest)
+release. See [`docs/CI-BUILD.md`](docs/CI-BUILD.md) for the step-by-step, the exact tool versions and
+the verification output of the current artifact.
 
 ## Install
 
