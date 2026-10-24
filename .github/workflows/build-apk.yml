@@ -109,7 +109,9 @@ jobs:
           # `--locked` first (reproducible), then a plain install: a published crate whose
           # committed lockfile names a since-yanked dependency only installs the second way.
           cargo install cargo-apk --locked || cargo install cargo-apk
-          cargo apk --version
+          # `cargo apk --version` is not a flag in 0.10; prove the subcommand is on PATH.
+          command -v cargo-apk
+          cargo apk build --help | head -5
 
       - name: Assemble the build tree (upstream pin + this shell crate)
         run: |
@@ -235,7 +237,9 @@ jobs:
           if [ -f /tmp/ci-tail.log ]; then
             python3 - /tmp/ci-tail.log <<'PY'
           import sys
+          import re
           data = open(sys.argv[1], errors="replace").read()[-6000:]
+          data = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", data)
           data = data.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
           print("::error::" + data)
           PY
@@ -244,6 +248,7 @@ jobs:
           fi
           # A second, shorter annotation keeps the last lines visible even if the first is
           # clipped by the annotation size limit.
-          tail -c 2500 /tmp/ci-tail.log 2>/dev/null | python3 -c 'import sys
-          data = sys.stdin.read().replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+          tail -c 2500 /tmp/ci-tail.log 2>/dev/null | python3 -c 'import re, sys
+          data = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", sys.stdin.read())
+          data = data.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
           print("::error::TAIL " + data)'
