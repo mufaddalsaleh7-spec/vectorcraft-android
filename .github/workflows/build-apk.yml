@@ -1,0 +1,223 @@
+name: Build VectorCraft APK (arm64-v8a)
+
+# The APK cannot be produced in a sandbox with no crates.io, no Android NDK and no JDK,
+# so the assembly + cross-compile the README describes by hand runs here instead. The
+# result is a signed arm64-v8a APK attached to the rolling `ci-latest` release, plus a
+# build artifact, plus the `aapt2` / `apksigner` verification the README's table asks for.
+#
+# What is built is exactly what the README says: upstream storytold/vectorcraft at the
+# pinned commit, with this repository's `apps/vectorcraft-android/` copied in. No upstream
+# file is edited.
+
+on:
+  push:
+    branches:
+      - "arena/aeb4f480-vectorcraft-android"
+    paths:
+      - ".github/workflows/build-apk.yml"
+      - "apps/vectorcraft-android/**"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: apk-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: storytold/vectorcraft
+  UPSTREAM_SHA: 2ac3ba2b866ad9d34b2252dd8024f73e34f4b2b8
+  NDK_VERSION: 27.2.12479018
+  BUILD_TOOLS_VERSION: 35.0.0
+  CARGO_APK_VERSION: "" # empty = latest published cargo-apk
+
+jobs:
+  build:
+    name: Cross-compile + sign
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout this repository (the Android layer)
+        uses: actions/checkout@v4
+
+      - name: JDK 21 (apksigner / keytool)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Rust toolchain + aarch64-linux-android target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Cache cargo registry and git deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-${{ hashFiles('.github/workflows/build-apk.yml') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Android SDK packages (platform, build-tools, NDK)
+        run: |
+          set -euo pipefail
+          export ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          SDKMGR="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKMGR" ]; then
+            echo "sdkmanager not found at $SDKMGR"; ls "$ANDROID_HOME" || true; exit 1
+          fi
+          yes | "$SDKMGR" --licenses > /dev/null || true
+          "$SDKMGR" --install "platforms;android-35" \
+                             "build-tools;${{ env.BUILD_TOOLS_VERSION }}" \
+                             "ndk;${{ env.NDK_VERSION }}" \
+                             "platform-tools"
+
+      - name: Environment for the cross-compile
+        run: |
+          set -euo pipefail
+          NDK="$ANDROID_HOME/ndk/${{ env.NDK_VERSION }}"
+          test -d "$NDK" || { echo "NDK missing at $NDK"; exit 1; }
+          NDK_BIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          # cargo-apk reads ANDROID_NDK_HOME (or finds the newest NDK under ANDROID_HOME).
+          echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$NDK" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$NDK_BIN/aarch64-linux-android26-clang" >> "$GITHUB_ENV"
+          echo "CC_aarch64_linux_android=$NDK_BIN/aarch64-linux-android26-clang" >> "$GITHUB_ENV"
+          echo "CXX_aarch64_linux_android=$NDK_BIN/aarch64-linux-android26-clang++" >> "$GITHUB_ENV"
+          echo "AR_aarch64_linux_android=$NDK_BIN/llvm-ar" >> "$GITHUB_ENV"
+          echo "RANLIB_aarch64_linux_android=$NDK_BIN/llvm-ranlib" >> "$GITHUB_ENV"
+          # The shell crate asks cargo-apk for `strip = "strip"`; make that the NDK's
+          # llvm-strip rather than whatever GNU binutils the runner happens to ship.
+          mkdir -p "$RUNNER_TEMP/ndk-tools"
+          ln -sf "$NDK_BIN/llvm-strip" "$RUNNER_TEMP/ndk-tools/strip"
+          echo "$RUNNER_TEMP/ndk-tools" >> "$GITHUB_PATH"
+
+      - name: Install cargo-apk
+        run: |
+          set -euo pipefail
+          if [ -n "$CARGO_APK_VERSION" ]; then
+            cargo install cargo-apk --version "$CARGO_APK_VERSION" --locked
+          else
+            cargo install cargo-apk --locked
+          fi
+          cargo apk --version
+          rustc --version
+          cargo --version
+          java -version
+
+      - name: Assemble the build tree (upstream pin + this shell crate)
+        run: |
+          set -euo pipefail
+          SRC="$RUNNER_TEMP/src"
+          mkdir -p "$SRC"
+          curl -sSL --retry 3 -o "$RUNNER_TEMP/upstream.tar.gz" \
+            "https://codeload.github.com/${UPSTREAM_REPO}/tar.gz/${UPSTREAM_SHA}"
+          tar xzf "$RUNNER_TEMP/upstream.tar.gz" -C "$SRC" --strip-components=1
+          test -f "$SRC/Cargo.toml"
+          # Exactly what the README's "Build it" section does — nothing upstream is patched.
+          cp -r apps/vectorcraft-android "$SRC/apps/"
+          echo "SRC=$SRC" >> "$GITHUB_ENV"
+          echo "--- upstream pin content check:"
+          git -C "$SRC" rev-parse HEAD 2>/dev/null || echo "(tarball, no git metadata — pin is the SHA in UPSTREAM_SHA)"
+          ls "$SRC/apps"
+          grep -n 'name = "vectorcraft-android"' "$SRC/apps/vectorcraft-android/Cargo.toml"
+
+      - name: Sideload signing key (kept across runs so builds install over each other)
+        id: keystore-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/signing/vectorcraft-sideload.keystore
+          key: vectorcraft-sideload-keystore-v1
+
+      - name: Create the signing key if the cache was cold
+        run: |
+          set -euo pipefail
+          mkdir -p signing
+          KS="$GITHUB_WORKSPACE/signing/vectorcraft-sideload.keystore"
+          if [ ! -f "$KS" ]; then
+            keytool -genkeypair -keystore "$KS" -alias vectorcraft \
+              -keyalg RSA -keysize 2048 -validity 10000 -storetype PKCS12 \
+              -storepass android -keypass android \
+              -dname "CN=VectorCraft Sideload CI, O=VectorCraft Android port, C=US"
+            echo "generated a fresh sideload key"
+          else
+            echo "reusing the cached sideload key"
+          fi
+          keytool -list -keystore "$KS" -storepass android | tail -3
+
+      - name: cargo apk build --release
+        env:
+          CARGO_APK_RELEASE_KEYSTORE: ${{ github.workspace }}/signing/vectorcraft-sideload.keystore
+          CARGO_APK_RELEASE_KEYSTORE_PASSWORD: android
+        run: |
+          set -euo pipefail
+          cd "$SRC"
+          cargo apk build --release -p vectorcraft-android
+
+      - name: Verify the artifact (aapt2 / apksigner / sha256)
+        run: |
+          set -euo pipefail
+          APK="$SRC/target/release/apk/vectorcraft.apk"
+          ls -l "$APK"
+          BT="$ANDROID_HOME/build-tools/${{ env.BUILD_TOOLS_VERSION }}"
+          {
+            echo "### VectorCraft APK"
+            echo ""
+            echo '```'
+            "$BT/aapt2" dump badging "$APK" | grep -E "^package|^sdkVersion|^targetSdkVersion|^application|native-code|^launchable-activity|uses-permission|^feature" || true
+            echo "---- signature"
+            "$BT/apksigner" verify --verbose "$APK" 2>&1 | grep -E "Verified using|Verifies|DOES NOT VERIFY" || true
+            echo "---- native code inside the APK"
+            unzip -l "$APK" | grep -oE "lib/[a-z0-9_-]+/lib[a-z_]*\.so" | sort -u || true
+            echo "---- exported native symbols"
+            unzip -p "$APK" lib/arm64-v8a/libvectorcraft.so > "$RUNNER_TEMP/libvectorcraft.so"
+            "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-nm" --dynamic --defined-only "$RUNNER_TEMP/libvectorcraft.so" | grep -E "android_main|ANativeActivity_onCreate" || echo "(symbols not found)"
+            echo "---- sha256"
+            sha256sum "$APK"
+            echo "---- size"
+            du -h "$APK"
+            echo '```'
+          } | tee "$RUNNER_TEMP/summary.md"
+          ASSET="vectorcraft-0.9.0-arm64-v8a-$(date -u +%Y%m%d).apk"
+          cp "$APK" "$RUNNER_TEMP/$ASSET"
+          echo "ASSET=$ASSET" >> "$GITHUB_ENV"
+          echo "APK_PATH=$RUNNER_TEMP/$ASSET" >> "$GITHUB_ENV"
+          cat "$RUNNER_TEMP/summary.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the APK as a workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vectorcraft-apk-${{ github.run_number }}
+          path: ${{ env.APK_PATH }}
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Publish to the rolling `ci-latest` release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          APK="$APK_PATH"
+          NOTES="$RUNNER_TEMP/release-notes.md"
+          {
+            echo "Built by CI from this repository at \`${GITHUB_SHA}\`."
+            echo ""
+            echo "- upstream: \`${UPSTREAM_REPO}\` @ \`${UPSTREAM_SHA}\` (unmodified)"
+            echo "- package \`ai.storyteller.vectorcraft\`, versionName 0.9.0, arm64-v8a"
+            echo ""
+            cat "$RUNNER_TEMP/summary.md"
+          } > "$NOTES"
+          if gh release view ci-latest >/dev/null 2>&1; then
+            gh release edit ci-latest --notes-file "$NOTES"
+          else
+            gh release create ci-latest --target "$GITHUB_SHA" \
+              --title "VectorCraft for Android — current CI build" \
+              --notes-file "$NOTES"
+          fi
+          gh release upload ci-latest "$APK" --clobber || gh release upload ci-latest "$APK"
+          gh release view ci-latest --json assets --jq '.assets[] | "\(.name) \(.size) bytes"'
