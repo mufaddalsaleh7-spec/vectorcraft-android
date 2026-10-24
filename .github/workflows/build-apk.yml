@@ -1,13 +1,16 @@
 name: Build VectorCraft APK (arm64-v8a)
 
-# The APK cannot be produced in a sandbox with no crates.io, no Android NDK and no JDK,
-# so the assembly + cross-compile the README describes by hand runs here instead. The
-# result is a signed arm64-v8a APK attached to the rolling `ci-latest` release, plus a
-# build artifact, plus the `aapt2` / `apksigner` verification the README's table asks for.
+# The APK is cross-compiled here rather than on a workstation: it needs crates.io, the
+# Android NDK r27 and a JDK, and the result is a signed arm64-v8a APK attached to the
+# rolling `ci-latest` release.
 #
 # What is built is exactly what the README says: upstream storytold/vectorcraft at the
 # pinned commit, with this repository's `apps/vectorcraft-android/` copied in. No upstream
 # file is edited.
+#
+# Every step tees its output to /tmp/ci-tail.log; if the job fails, the tail of that file
+# is published as a check-run annotation, which is readable through the REST API even from
+# a network that cannot reach the Actions log host.
 
 on:
   push:
@@ -20,7 +23,6 @@ on:
 
 permissions:
   contents: write
-  issues: write
 
 concurrency:
   group: apk-${{ github.ref }}
@@ -31,12 +33,11 @@ env:
   UPSTREAM_SHA: 2ac3ba2b866ad9d34b2252dd8024f73e34f4b2b8
   NDK_VERSION: 27.2.12479018
   BUILD_TOOLS_VERSION: 35.0.0
-  CARGO_APK_VERSION: "" # empty = latest published cargo-apk
 
 jobs:
   build:
     name: Cross-compile + sign
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 350
 
     steps:
@@ -44,7 +45,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: JDK 21 (apksigner / keytool)
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "21"
@@ -65,6 +66,7 @@ jobs:
 
       - name: Android SDK packages (platform, build-tools, NDK)
         run: |
+          exec > >(tee -a /tmp/ci-tail.log) 2>&1
           set -euo pipefail
           export ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
           echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
@@ -80,9 +82,10 @@ jobs:
 
       - name: Environment for the cross-compile
         run: |
+          exec > >(tee -a /tmp/ci-tail.log) 2>&1
           set -euo pipefail
           NDK="$ANDROID_HOME/ndk/${{ env.NDK_VERSION }}"
-          test -d "$NDK" || { echo "NDK missing at $NDK"; exit 1; }
+          test -d "$NDK" || { echo "NDK missing at $NDK"; ls "$ANDROID_HOME/ndk" || true; exit 1; }
           NDK_BIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
           # cargo-apk reads ANDROID_NDK_HOME (or finds the newest NDK under ANDROID_HOME).
           echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
@@ -97,25 +100,20 @@ jobs:
           mkdir -p "$RUNNER_TEMP/ndk-tools"
           ln -sf "$NDK_BIN/llvm-strip" "$RUNNER_TEMP/ndk-tools/strip"
           echo "$RUNNER_TEMP/ndk-tools" >> "$GITHUB_PATH"
+          rustc --version; cargo --version; java -version
 
       - name: Install cargo-apk
         run: |
+          exec > >(tee -a /tmp/ci-tail.log) 2>&1
           set -euo pipefail
           # `--locked` first (reproducible), then a plain install: a published crate whose
           # committed lockfile names a since-yanked dependency only installs the second way.
-          if [ -n "$CARGO_APK_VERSION" ]; then
-            cargo install cargo-apk --version "$CARGO_APK_VERSION" --locked \
-              || cargo install cargo-apk --version "$CARGO_APK_VERSION"
-          else
-            cargo install cargo-apk --locked || cargo install cargo-apk
-          fi
+          cargo install cargo-apk --locked || cargo install cargo-apk
           cargo apk --version
-          rustc --version
-          cargo --version
-          java -version
 
       - name: Assemble the build tree (upstream pin + this shell crate)
         run: |
+          exec > >(tee -a /tmp/ci-tail.log) 2>&1
           set -euo pipefail
           SRC="$RUNNER_TEMP/src"
           mkdir -p "$SRC"
@@ -126,13 +124,11 @@ jobs:
           # Exactly what the README's "Build it" section does — nothing upstream is patched.
           cp -r apps/vectorcraft-android "$SRC/apps/"
           echo "SRC=$SRC" >> "$GITHUB_ENV"
-          echo "--- upstream pin content check:"
-          git -C "$SRC" rev-parse HEAD 2>/dev/null || echo "(tarball, no git metadata — pin is the SHA in UPSTREAM_SHA)"
+          echo "--- upstream tree:"
           ls "$SRC/apps"
           grep -n 'name = "vectorcraft-android"' "$SRC/apps/vectorcraft-android/Cargo.toml"
 
       - name: Sideload signing key (kept across runs so builds install over each other)
-        id: keystore-cache
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/signing/vectorcraft-sideload.keystore
@@ -140,6 +136,7 @@ jobs:
 
       - name: Create the signing key if the cache was cold
         run: |
+          exec > >(tee -a /tmp/ci-tail.log) 2>&1
           set -euo pipefail
           mkdir -p signing
           KS="$GITHUB_WORKSPACE/signing/vectorcraft-sideload.keystore"
@@ -159,12 +156,14 @@ jobs:
           CARGO_APK_RELEASE_KEYSTORE: ${{ github.workspace }}/signing/vectorcraft-sideload.keystore
           CARGO_APK_RELEASE_KEYSTORE_PASSWORD: android
         run: |
+          exec > >(tee -a /tmp/ci-tail.log) 2>&1
           set -euo pipefail
           cd "$SRC"
           cargo apk build --release -p vectorcraft-android
 
       - name: Verify the artifact (aapt2 / apksigner / sha256)
         run: |
+          exec > >(tee -a /tmp/ci-tail.log) 2>&1
           set -euo pipefail
           APK="$SRC/target/release/apk/vectorcraft.apk"
           ls -l "$APK"
@@ -194,6 +193,7 @@ jobs:
           cat "$RUNNER_TEMP/summary.md" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload the APK as a workflow artifact
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: vectorcraft-apk-${{ github.run_number }}
@@ -202,9 +202,11 @@ jobs:
           if-no-files-found: error
 
       - name: Publish to the rolling `ci-latest` release
+        if: success()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          exec > >(tee -a /tmp/ci-tail.log) 2>&1
           set -euo pipefail
           APK="$APK_PATH"
           NOTES="$RUNNER_TEMP/release-notes.md"
@@ -226,32 +228,22 @@ jobs:
           gh release upload ci-latest "$APK" --clobber || gh release upload ci-latest "$APK"
           gh release view ci-latest --json assets --jq '.assets[] | "\(.name) \(.size) bytes"'
 
-      - name: Report failure details to an issue (the log host is not reachable everywhere)
+      - name: Publish the failure tail as a check annotation
         if: failure()
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -uo pipefail
-          JOB_ID=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs" \
-                     --jq '.jobs[] | select(.name | test("Cross-compile")) | .id' | head -1)
-          echo "job id: $JOB_ID"
-          gh api "repos/$GITHUB_REPOSITORY/actions/jobs/$JOB_ID/logs" > /tmp/job.log 2>/tmp/log.err || true
-          SIZE=$(wc -c < /tmp/job.log || echo 0)
-          echo "log bytes: $SIZE"; cat /tmp/log.err || true
-          # Keep the tail: the failing step's output is what explains the failure.
-          tail -c 60000 /tmp/job.log > /tmp/tail.txt 2>/dev/null || true
-          {
-            echo "Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
-            echo "Commit: $GITHUB_SHA"
-            echo ""
-            echo '```'
-            cat /tmp/tail.txt
-            echo '```'
-          } > /tmp/body.md
-          TITLE="CI build log"
-          NUM=$(gh issue list --state open --search "in:title \"$TITLE\"" --json number --jq '.[0].number' || true)
-          if [ -n "$NUM" ] && [ "$NUM" != "null" ]; then
-            gh issue comment "$NUM" --body-file /tmp/body.md
+          if [ -f /tmp/ci-tail.log ]; then
+            python3 - /tmp/ci-tail.log <<'PY'
+          import sys
+          data = open(sys.argv[1], errors="replace").read()[-6000:]
+          data = data.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+          print("::error::" + data)
+          PY
           else
-            gh issue create --title "$TITLE" --body-file /tmp/body.md
+            echo "::error::no /tmp/ci-tail.log was captured"
           fi
+          # A second, shorter annotation keeps the last lines visible even if the first is
+          # clipped by the annotation size limit.
+          tail -c 2500 /tmp/ci-tail.log 2>/dev/null | python3 -c 'import sys
+          data = sys.stdin.read().replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+          print("::error::TAIL " + data)'
